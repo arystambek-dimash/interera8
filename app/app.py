@@ -33,7 +33,7 @@ class AppFactory:
     def _configure_routes(self):
         self.app.include_router(
             interera.router,
-            prefix="/api/v1/interera",
+            prefix="/api/v1",
             tags=["Interera"],
         )
 
