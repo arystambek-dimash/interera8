@@ -42,17 +42,79 @@ Do NOT do:
 
 INPAINT_PROMPT_TEMPLATE = textwrap.dedent("""
 ROLE:
-You are an industrial designer creating product-documentation drawings.
-...
+You are an industrial designer creating clean product-documentation drawings from a photo.
+
+TASK SUMMARY:
+From the input photo, identify EXACTLY ONE target object (usually furniture) and produce a set of 5 consistent product views:
+1) front view, 2) right-side view, 3) back view, 4) left-side view, 5) top view.
+
+TARGET OBJECT SELECTION (critical):
+The user may provide EITHER:
+A) A single red point marking the target object
+B) No point, plus an optional text detail describing what object to select
+
+INPUTS:
+- Photo: provided by user
+- Optional user detail request: "{optional_detail}" (may be empty)
+
+RULE 1 — If a red point exists:
+- The object UNDER the red point is the ONE AND ONLY target object.
+- If the point is on/near an edge, choose the object that the point most clearly belongs to.
+- Ignore all other objects completely.
+
+RULE 2 — If no red point exists:
+- If optional_detail is provided, use it to choose the target object from the photo.
+  Examples: "the chair", "the white sofa", "the table near the window".
+- If optional_detail is empty OR multiple objects match, choose using this priority:
+  (1) the most central large furniture-like object
+  (2) the largest clearly visible object
+  (3) the object with the clearest complete silhouette
+- If the photo contains no furniture-like object, select the most salient product-like object.
+
+STRICT PRESERVATION (must hold):
+- Preserve the target object identity: overall shape, proportions, structure, color(s), pattern, and material appearance.
+- Do NOT redesign, do NOT add/remove parts, do NOT change style, do NOT “improve” it.
+- Minor cleanup is allowed only to create a clean documentation drawing (e.g., removing noise, straightening lines).
+- If the optional_detail conflicts with preservation, IGNORE the conflicting parts.
+
+BACKGROUND REMOVAL:
+- Remove the entire environment/background.
+- Output must contain ONLY the isolated target object on a plain white background (or transparent if supported).
+- No room elements, no floor, no shadows from the room, no other objects.
+
+DOCUMENTATION DRAWING STYLE:
+- Clean, crisp, product-documentation look.
+- Consistent perspective across all 5 views (orthographic/isometric-like but consistent and readable).
+- Uniform lighting; no dramatic shadows; no reflections from the room.
+- Edges and contours should be clear.
+- Keep textures/patterns minimal but faithful (don’t invent patterns).
+
+VIEW CONSISTENCY RULES:
+- All 5 views must represent the SAME object with matching colors and details.
+- Dimensions/proportions must match across views.
+- Do not mirror incorrectly: left view and right view must be correct.
+- The top view must match the object’s real top surface and outline.
+
+WHAT TO DO IF THE TARGET IS PARTIALLY OCCLUDED:
+- Reconstruct the hidden parts conservatively using symmetry/common geometry ONLY when necessary.
+- Never invent decorative details.
+- Prefer the simplest plausible completion that keeps identity consistent.
+
+OUTPUT REQUIREMENTS:
+- Provide exactly 5 views: front, right, back, left, top.
+- The target object is centered, large enough, and not cropped in any view.
+- No extra annotations, no text labels, no measurements unless explicitly requested.
+
 USER DETAIL REQUEST:
 - User request (optional): {optional_detail}
-- Apply it ONLY if it does NOT change the furniture identity (shape/material/color).
-  If it conflicts with STRICT PRESERVATION, ignore the request.
+- Apply it ONLY if it helps select the correct target object or clarifies non-identity details.
+- Do NOT apply it if it changes the furniture identity (shape/material/color/pattern/structure).
 
 FINAL QUALITY CHECK (must pass):
-- The furniture looks like the same object from the photo (same shape + colors).
+- Exactly ONE target object is depicted.
+- The object looks like the same object from the photo (same shape + colors/material).
 - No background environment is visible.
-- All 5 views are present and consistent.
+- All 5 views are present, correctly ordered, and consistent.
 """).strip()
 
 
@@ -115,6 +177,7 @@ async def _run_gemini(gemini_service: GeminiService, prompt: str, image: UploadF
 
 def _require_existing_session(request: Request) -> str:
     session_id = _get_session_id(request)
+    print(session_id)
     if not session_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing session cookie.")
     return session_id
@@ -152,11 +215,10 @@ async def create_interera(
 @inject
 async def create_interera_inpaint(
         request: Request,
-        response: Response,
         image: UploadFile = File(...),
         optional_detail: str = Form(""),
         gemini_service: GeminiService = Depends(Provide[AppContainer.gemini_service]),
-) -> IntereraResponse:
+) -> Response:
     prompt = INPAINT_PROMPT_TEMPLATE.format(optional_detail=optional_detail.strip())
     img_bytes = await _run_gemini(gemini_service, prompt, image)
 
