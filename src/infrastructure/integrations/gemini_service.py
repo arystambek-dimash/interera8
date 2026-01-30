@@ -1,4 +1,5 @@
 from io import BytesIO
+from typing import List
 
 from PIL import Image
 from dotenv import load_dotenv
@@ -15,15 +16,13 @@ class GeminiService:
         self.client = genai.Client(api_key=api_key)
         self.model_id = model_id
 
-    async def execute(self, prompt: str, media: Media = None) -> bytes | None:
+    async def execute(self, prompt: str, medias: List[Media] = None) -> bytes | None:
         contents = [prompt]
 
-        if media:
-            contents.append(types.Part.from_bytes(
-                data=media.media_data,
-                mime_type=media.media_type
-            ))
-
+        for m in medias or []:
+            contents.append(
+                types.Part.from_bytes(data=m.media_data, mime_type=m.media_type)
+            )
         response = await self.client.aio.models.generate_content(
             model=self.model_id,
             contents=contents

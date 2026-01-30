@@ -4,6 +4,7 @@ import base64
 import imghdr
 import textwrap
 import uuid
+from pathlib import Path
 from typing import List
 
 from dependency_injector.wiring import Provide, inject
@@ -41,80 +42,29 @@ Do NOT do:
 """).strip()
 
 INPAINT_PROMPT_TEMPLATE = textwrap.dedent("""
-ROLE:
-You are an industrial designer creating clean product-documentation drawings from a photo.
+You will receive TWO images:
+- Image 1: a room photo containing a furniture object.
+- Image 2: a binary mask (same size). White = the target object. Black = everything else.
 
-TASK SUMMARY:
-From the input photo, identify EXACTLY ONE target object (usually furniture) and produce a set of 5 consistent product views:
-1) front view, 2) right-side view, 3) back view, 4) left-side view, 5) top view.
+TASK:
+1) Identify the furniture object in Image 1 that corresponds to the WHITE area of Image 2.
+2) Using ONLY that object as reference, generate a professional furniture design drawing sheet.
+3) The output must be ONE clean sheet on a pure white (or very light neutral) background.
 
-TARGET OBJECT SELECTION (critical):
-The user may provide EITHER:
-A) A single red point marking the target object
-B) No point, plus an optional text detail describing what object to select
+VIEWS (same scale):
+- Front orthographic
+- Side orthographic
+- Back orthographic
+- Top orthographic
+- One 3/4 perspective
 
-INPUTS:
-- Photo: provided by user
-- Optional user detail request: "{optional_detail}" (may be empty)
+STRICT:
+- Preserve silhouette, proportions, legs, cushions, seams, panels, materials, and colors.
+- No redesign, no style changes, no extra features.
+- No room/background. Only the isolated object on white.
+- Clean industrial design / product documentation look.
 
-RULE 1 — If a red point exists:
-- The object UNDER the red point is the ONE AND ONLY target object.
-- If the point is on/near an edge, choose the object that the point most clearly belongs to.
-- Ignore all other objects completely.
-
-RULE 2 — If no red point exists:
-- If optional_detail is provided, use it to choose the target object from the photo.
-  Examples: "the chair", "the white sofa", "the table near the window".
-- If optional_detail is empty OR multiple objects match, choose using this priority:
-  (1) the most central large furniture-like object
-  (2) the largest clearly visible object
-  (3) the object with the clearest complete silhouette
-- If the photo contains no furniture-like object, select the most salient product-like object.
-
-STRICT PRESERVATION (must hold):
-- Preserve the target object identity: overall shape, proportions, structure, color(s), pattern, and material appearance.
-- Do NOT redesign, do NOT add/remove parts, do NOT change style, do NOT “improve” it.
-- Minor cleanup is allowed only to create a clean documentation drawing (e.g., removing noise, straightening lines).
-- If the optional_detail conflicts with preservation, IGNORE the conflicting parts.
-
-BACKGROUND REMOVAL:
-- Remove the entire environment/background.
-- Output must contain ONLY the isolated target object on a plain white background (or transparent if supported).
-- No room elements, no floor, no shadows from the room, no other objects.
-
-DOCUMENTATION DRAWING STYLE:
-- Clean, crisp, product-documentation look.
-- Consistent perspective across all 5 views (orthographic/isometric-like but consistent and readable).
-- Uniform lighting; no dramatic shadows; no reflections from the room.
-- Edges and contours should be clear.
-- Keep textures/patterns minimal but faithful (don’t invent patterns).
-
-VIEW CONSISTENCY RULES:
-- All 5 views must represent the SAME object with matching colors and details.
-- Dimensions/proportions must match across views.
-- Do not mirror incorrectly: left view and right view must be correct.
-- The top view must match the object’s real top surface and outline.
-
-WHAT TO DO IF THE TARGET IS PARTIALLY OCCLUDED:
-- Reconstruct the hidden parts conservatively using symmetry/common geometry ONLY when necessary.
-- Never invent decorative details.
-- Prefer the simplest plausible completion that keeps identity consistent.
-
-OUTPUT REQUIREMENTS:
-- Provide exactly 5 views: front, right, back, left, top.
-- The target object is centered, large enough, and not cropped in any view.
-- No extra annotations, no text labels, no measurements unless explicitly requested.
-
-USER DETAIL REQUEST:
-- User request (optional): {optional_detail}
-- Apply it ONLY if it helps select the correct target object or clarifies non-identity details.
-- Do NOT apply it if it changes the furniture identity (shape/material/color/pattern/structure).
-
-FINAL QUALITY CHECK (must pass):
-- Exactly ONE target object is depicted.
-- The object looks like the same object from the photo (same shape + colors/material).
-- No background environment is visible.
-- All 5 views are present, correctly ordered, and consistent.
+User note: {optional_detail}
 """).strip()
 
 
@@ -158,20 +108,38 @@ def _append_to_session_cache(session_id: str, img_bytes: bytes) -> None:
         del history[:-MAX_HISTORY]
 
 
-async def _run_gemini(gemini_service: GeminiService, prompt: str, image: UploadFile) -> bytes:
-    if image.content_type not in ALLOWED_IMAGE_TYPES:
+async def _read_upload(u: UploadFile, fallback_mime: str | None = None) -> tuple[bytes, str]:
+    mime = u.content_type or fallback_mime or ""
+    if mime not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported content_type={image.content_type}. Allowed: {sorted(ALLOWED_IMAGE_TYPES)}",
+            detail=f"Unsupported content_type={mime!r}. Allowed: {sorted(ALLOWED_IMAGE_TYPES)}",
         )
-
-    data = await image.read()
+    data = await u.read()
     if not data:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file.")
+    return data, mime
 
-    media = Media(media_data=data, media_type=image.content_type)
-    img = await gemini_service.execute(prompt.strip(), media=media)
-    print(type(img))
+
+async def _run_gemini(
+        gemini_service: GeminiService,
+        prompt: str,
+        uploads: list[UploadFile],
+        debug_names: list[str] | None = None,
+) -> bytes:
+    medias: list[Media] = []
+    debug_names = debug_names or [f"img{i + 1}" for i in range(len(uploads))]
+    DEBUG_DIR = Path(__file__).parent / "debug"
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    for u, name in zip(uploads, debug_names):
+        fallback = "image/png" if name == "mask" else None
+        data, mime = await _read_upload(u, fallback_mime=fallback)
+        medias.append(Media(media_data=data, media_type=mime))
+        with open(f"{DEBUG_DIR}/{name}.bin", "wb") as f:
+            f.write(data)
+    img = await gemini_service.execute(prompt.strip(), medias=medias)
+    if not img:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gemini returned no image.")
     return img
 
 
@@ -190,7 +158,7 @@ async def create_interera(
         image: UploadFile = File(...),
         gemini_service: GeminiService = Depends(Provide[AppContainer.gemini_service]),
 ) -> Response:
-    img_bytes = await _run_gemini(gemini_service, INTERERA_PROMPT, image)
+    img_bytes = await _run_gemini(gemini_service, INTERERA_PROMPT, [image])
 
     session_id = _get_session_id(request) or uuid.uuid4().hex
     _append_to_session_cache(session_id, img_bytes)
@@ -215,19 +183,19 @@ async def create_interera(
 @inject
 async def create_interera_inpaint(
         request: Request,
-        image: UploadFile = File(...),
+        image: UploadFile = File(...),  # base image (current generated)
+        mask: UploadFile = File(...),  # mask (black/white)
         optional_detail: str = Form(""),
         gemini_service: GeminiService = Depends(Provide[AppContainer.gemini_service]),
 ) -> Response:
     prompt = INPAINT_PROMPT_TEMPLATE.format(optional_detail=optional_detail.strip())
-    img_bytes = await _run_gemini(gemini_service, prompt, image)
+
+    img_bytes = await _run_gemini(gemini_service, prompt, [image, mask])
 
     session_id = _get_session_id(request) or uuid.uuid4().hex
     _append_to_session_cache(session_id, img_bytes)
 
-    media_type = _detect_media_type(img_bytes)
-    resp = Response(content=img_bytes, media_type=media_type)
-
+    resp = Response(content=img_bytes, media_type=_detect_media_type(img_bytes))
     if not _get_session_id(request):
         resp.set_cookie(
             key="session",
@@ -237,7 +205,6 @@ async def create_interera_inpaint(
             secure=False,
             max_age=60 * 60 * 24 * 7,
         )
-
     return resp
 
 
